@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>双车对战</title>
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:Consolas,Menlo,monospace;user-select:none;touch-action:none}
+  #container{position:relative;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center;background:#000}
+  #canvas{max-width:100%;max-height:100%;display:block;background:#0f1115;box-shadow:0 0 40px rgba(57,217,138,.15)}
+  #touch-ui{display:none;position:absolute;inset:0;pointer-events:none}
+  #touch-ui.visible{display:block}
+  #joy-zone{position:absolute;left:20px;bottom:20px;width:150px;height:150px;border-radius:50%;background:rgba(255,255,255,.05);border:2px solid rgba(255,255,255,.12);pointer-events:auto;touch-action:none}
+  #joy-knob{position:absolute;left:50%;top:50%;width:60px;height:60px;margin:-30px 0 0 -30px;border-radius:50%;background:rgba(57,217,138,.55);border:2px solid #39d98a;transition:transform .05s linear}
+  #fire-btn{position:absolute;right:30px;bottom:40px;width:110px;height:110px;border-radius:50%;background:rgba(233,75,60,.35);border:3px solid #e94b3c;color:#ffd8d3;font-size:20px;font-family:inherit;font-weight:bold;pointer-events:auto;touch-action:none}
+  #fire-btn:active{background:rgba(233,75,60,.7)}
+  #overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.8);z-index:10}
+  #overlay.hidden{display:none}
+  .box{background:#12161d;border:3px solid #39d98a;border-radius:12px;padding:28px;width:min(90%,420px);text-align:center;font-family:Consolas,monospace;color:#39d98a}
+  .box h2{font-size:20px;margin-bottom:18px}
+  .box input{width:100%;padding:14px;font-size:26px;text-align:center;letter-spacing:6px;font-family:Consolas,monospace;background:#0f1115;border:2px solid #39d98a;color:#39d98a;border-radius:8px;text-transform:uppercase;outline:none}
+  .box .row{display:flex;gap:12px;margin-top:18px}
+  .box button{flex:1;padding:12px;font-size:16px;font-family:inherit;font-weight:bold;border-radius:8px;cursor:pointer;border:2px solid}
+  .btn-cancel{background:#3d2020;border-color:#ff6b6b;color:#ff6b6b}
+  .btn-ok{background:#1f3a2b;border-color:#39d98a;color:#39d98a}
+  .msg{color:#ff6b6b;font-size:12px;margin-top:12px;min-height:16px}
+</style>
+</head>
+<body>
+<div id="container">
+  <canvas id="canvas" width="864" height="576"></canvas>
+  <div id="touch-ui">
+    <div id="joy-zone"><div id="joy-knob"></div></div>
+    <button id="fire-btn">发射</button>
+  </div>
+  <div id="overlay" class="hidden">
+    <div class="box" id="box"></div>
+  </div>
+</div>
+<script>
+'use strict';
+
+const CELL=24,COLS=36,ROWS=24,W=COLS*CELL,H=ROWS*CELL,SQ2=Math.SQRT2;
+const MAX_HP=100,MISSILE_SPEED=18.0,EXPLOSION_RADIUS=3.0,DMG_CENTER=50,DMG_EDGE=10,EXPLOSION_DURATION=.45,NUM_MAPS=5;
+const NEIGHBORS=[[1,0,1],[-1,0,1],[0,1,1],[0,-1,1],[1,1,SQ2],[1,-1,SQ2],[-1,1,SQ2],[-1,-1,SQ2]];
+const AI_DIFFICULTY={
+  easy:{fire_cd:1.0,aim_tolerance:.40,fire_range:9.0,turn_deadzone:.25,approach_dist:5.5,retreat_dist:1.5,advance_prob:.45,lead_aim:false},
+  hard:{fire_cd:.30,aim_tolerance:.10,fire_range:20.0,turn_deadzone:.06,approach_dist:4.0,retreat_dist:2.0,advance_prob:.85,lead_aim:true}
+};
+
+// ---- 工具 ----
+const octile=(a,b)=>{const dx=Math.abs(a[0]-b[0]),dy=Math.abs(a[1]-b[1]);return Math.max(dx,dy)+(SQ2-1)*Math.min(dx,dy)};
+const angleDiff=(a,b)=>(b-a+Math.PI)%(2*Math.PI)-Math.PI;
+const normAngle=a=>(a+Math.PI)%(2*Math.PI)-Math.PI;
+const key=(c,r)=>c+r*COLS;
+const fmtTime=s=>{s=Math.max(0,Math.floor(s));return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')};
+const randInt=(lo,hi)=>Math.floor(Math.random()*(hi-lo+1))+lo;
+
+function astar(blocked,start,goal){
+  const sK=key(start[0],start[1]),gK=key(goal[0],goal[1]);
+  if(sK===gK)return[start];
+  if(blocked.has(sK)||blocked.has(gK))return null;
+  const open=[[octile(start,goal),0,start]],came=new Map(),gScore=new Map([[sK,0]]),closed=new Set();
+  while(open.length){
+    let mi=0;for(let i=1;i<open.length;i++)if(open[i][0]<open[mi][0])mi=i;
+    const[f,g,cur]=open.splice(mi,1)[0],cK=key(cur[0],cur[1]);
+    if(cK===gK){const path=[cur];let p=cur;while(came.has(key(p[0],p[1]))){p=came.get(key(p[0],p[1]));path.push(p)}path.reverse();return path}
+    if(closed.has(cK))continue;closed.add(cK);
+    for(const[dx,dy,w]of NEIGHBORS){
+      const nx=cur[0]+dx,ny=cur[1]+dy;
+      if(nx<0||nx>=COLS||ny<0||ny>=ROWS)continue;
+      const nK=key(nx,ny);if(blocked.has(nK))continue;
+      if(dx&&dy){if(blocked.has(key(cur[0]+dx,cur[1]))||blocked.has(key(cur[0],cur[1]+dy)))continue}
+      const ng=g+w;
+      if(ng<(gScore.get(nK)??Infinity)){gScore.set(nK,ng);came.set(nK,cur);open.push([ng+octile([nx,ny],goal),ng,[nx,ny]])}
+    }
+  }
+  return null;
+}
+
+// ---- 网络 ----
+const LOBBY_TOPIC='carx-lobby-public-v1';
+const HEARTBEAT_MS=8000;
+const ROOM_TIMEOUT_MS=22000;
+
+const net={
+  mode:'off',peer:null,conn:null,roomId:'',connected:false,
+  remoteKeys:new Set(),remoteState:null,statusMsg:'',
+  // 大厅
+  lobbyRooms:new Map(),   // roomId -> {ts, tsLocal}
+  lobbyES:null,
+  heartbeatTimer:null,
+  // 重连
+  reconnectAttempts:0,
+  maxReconnect:3,
+  lastRoom:'',
+};
+
+function randomRoomId(){const cs='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let s='';for(let i=0;i<6;i++)s+=cs[Math.floor(Math.random()*cs.length)];return s}
+function destroyPeer(){if(net.peer){try{net.peer.destroy()}catch(e){}}net.peer=null;net.conn=null;net.connected=false;net.remoteKeys=new Set();net.remoteState=null}
+
+// 大厅心跳（主机）
+function startHeartbeat(roomId){
+  stopHeartbeat();
+  const beat=()=>{
+    fetch('https://ntfy.sh/'+LOBBY_TOPIC,{
+      method:'POST',
+      headers:{'Content-Type':'text/plain','Title':'room'},
+      body:JSON.stringify({room:roomId,ts:Date.now()})
+    }).catch(()=>{});
+  };
+  beat();
+  net.heartbeatTimer=setInterval(beat,HEARTBEAT_MS);
+}
+function stopHeartbeat(){if(net.heartbeatTimer){clearInterval(net.heartbeatTimer);net.heartbeatTimer=null}}
+
+// 订阅大厅（客户端）
+function subscribeLobby(){
+  if(net.lobbyES)return;
+  try{
+    const es=new EventSource('https://ntfy.sh/'+LOBBY_TOPIC+'/sse');
+    es.onmessage=(e)=>{
+      try{
+        const d=JSON.parse(e.data);
+        if(d.event!=='message'||!d.message)return;
+        const info=JSON.parse(d.message);
+        if(info.room)net.lobbyRooms.set(info.room,{ts:info.ts,seen:Date.now()});
+      }catch(err){}
+    };
+    es.onerror=()=>{};
+    net.lobbyES=es;
+  }catch(e){}
+}
+function unsubscribeLobby(){if(net.lobbyES){try{net.lobbyES.close()}catch(e){}net.lobbyES=null}}
+
+function getActiveRooms(){
+  const now=Date.now();
+  const out=[];
+  for(const[room,info]of net.lobbyRooms){
+    if(now-info.seen<ROOM_TIMEOUT_MS)out.push(room);
+  }
+  return out.sort();
+}
+
+// ---- 创建/加入房间 ----
+function hostRoom(){
+  destroyPeer();stopHeartbeat();
+  const roomId=randomRoomId();
+  net.mode='host';net.roomId=roomId;net.statusMsg='正在创建房间...';
+  G.state='host-wait';
+  net.peer=new Peer('carx-'+roomId,{debug:0});
+  net.peer.on('open',()=>{
+    net.statusMsg='房间已创建，等待对方加入...';
+    startHeartbeat(roomId);
+  });
+  net.peer.on('connection',(conn)=>{
+    net.conn=conn;
+    conn.on('open',()=>{
+      net.connected=true;net.statusMsg='对方已连接';G.state='select';G.playMode='network';
+    });
+    conn.on('data',handleNetData);
+    conn.on('close',()=>{net.connected=false;net.statusMsg='对方已断开'});
+    conn.on('error',err=>console.error('conn',err));
+  });
+  net.peer.on('error',err=>{
+    console.error('peer',err);
+    net.statusMsg='创建失败: '+(err.type||err.message||'未知');
+  });
+}
+
+function joinRoom(roomId,isReconnect){
+  destroyPeer();
+  if(!isReconnect){net.mode='client';net.reconnectAttempts=0}
+  net.roomId=roomId;
+  net.lastRoom=roomId;
+  try{localStorage.setItem('carx_last_room',roomId)}catch(e){}
+  if(!isReconnect)G.state='join-wait';
+  net.peer=new Peer({debug:0});
+  net.peer.on('open',()=>{
+    const conn=net.peer.connect('carx-'+roomId,{reliable:true});
+    net.conn=conn;
+    conn.on('open',()=>{
+      net.connected=true;net.statusMsg='已连接，等待主机开始';
+      G.state='select';G.playMode='network';
+      net.reconnectAttempts=0;
+    });
+    conn.on('data',handleNetData);
+    conn.on('close',()=>{
+      net.connected=false;
+      if(net.mode==='client'&&net.reconnectAttempts<net.maxReconnect){
+        net.reconnectAttempts++;
+        net.statusMsg='连接断开，正在重连 '+net.reconnectAttempts+'/'+net.maxReconnect;
+        setTimeout(()=>joinRoom(net.lastRoom,true),1500);
+      }else{
+        net.statusMsg='连接已断开';
+      }
+    });
+    conn.on('error',err=>console.error('conn',err));
+  });
+  net.peer.on('error',err=>{
+    console.error('peer',err);
+    if(err.type==='peer-unavailable'){
+      net.statusMsg='房间不存在或已关闭';
+    }else{
+      net.statusMsg='连接失败: '+(err.type||err.message||'未知');
+    }
+    if(!isReconnect)setTimeout(()=>{G.state='menu';destroyPeer();net.mode='off'},1500);
+  });
+}
+
+function handleNetData(data){
+  if(!data)return;
+  if(data.t==='keys'&&net.mode==='host'){net.remoteKeys=new Set(data.k)}
+  else if(data.t==='state'&&net.mode==='client'){net.remoteState=data.s}
+  else if(data.t==='start'&&net.mode==='client'){
+    G.blocked=new Set(data.blocked);G.playMode='network';
+    G.p1={x:2.5,y:2.5,ang:0,tAng:0,hp:MAX_HP,rot:false};
+    G.p2={x:COLS-2.5,y:ROWS-2.5,ang:Math.PI,tAng:Math.PI,hp:MAX_HP,rot:false};
+    G.missiles=[];G.explosions=[];G.queue=[];G.elapsed=0;G.dmg1=0;G.dmg2=0;G.winner=null;
+    G.state='play';
+  }
+  else if(data.t==='back'&&net.mode==='client'){
+    destroyPeer();net.mode='off';G.state='menu';
+  }
+}
+function sendNet(data){if(net.conn&&net.connected){try{net.conn.send(data)}catch(e){}}}
+
+// ---- 全局 ----
+const canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d');
+const G={
+  state:'menu',maps:[],selectedMapIdx:0,selectedCar:'red',
+  playMode:'single',aiDifficulty:'easy',
+  blocked:new Set(),
+  p1:{x:2.5,y:2.5,ang:0,tAng:0,hp:MAX_HP,rot:false},
+  p2:{x:COLS-2.5,y:ROWS-2.5,ang:Math.PI,tAng:Math.PI,hp:MAX_HP,rot:false},
+  prev1:{x:0,y:0},prev2:{x:0,y:0},
+  missiles:[],explosions:[],queue:[],
+  elapsed:0,dmg1:0,dmg2:0,winner:null,
+  fireCd1:0,fireCd2:0,aiFireCd:0,
+  aiPath:[],aiPathTimer:0,aiStuckTimer:0,aiLastDrive:0,
+  aiLast1:{x:0,y:0},aiLast2:{x:0,y:0},
+  keys:new Set(),
+  touch:{joyX:0,joyY:0,active:false,fire:false},
+  btns:{},
+  lobbyLastRefresh:0,
+};
+
+// ---- 地图 ----
+function generateMapData(){
+  const b=new Set();
+  for(let c=0;c<COLS;c++){b.add(key(c,0));b.add(key(c,ROWS-1))}
+  for(let r=0;r<ROWS;r++){b.add(key(0,r));b.add(key(COLS-1,r))}
+  const n=randInt(16,24);
+  for(let i=0;i<n;i++){
+    const w=randInt(1,5),h=randInt(1,5);
+    const x=randInt(2,Math.max(2,COLS-3-w)),y=randInt(2,Math.max(2,ROWS-3-h));
+    for(let dx=0;dx<w;dx++)for(let dy=0;dy<h;dy++)b.add(key(x+dx,y+dy));
+  }
+  for(const[cx,cy]of[[2,2],[COLS-3,ROWS-3]])
+    for(let dx=-2;dx<=2;dx++)for(let dy=-2;dy<=2;dy++)b.delete(key(cx+dx,cy+dy));
+  return b;
+}
+function initMaps(){G.maps=[];for(let i=0;i<NUM_MAPS;i++)G.maps.push(generateMapData())}
+
+// ---- 开始 ----
+function startGame(idx){
+  G.blocked=new Set(G.maps[idx]);G.state='play';
+  G.p1={x:2.5,y:2.5,ang:0,tAng:0,hp:MAX_HP,rot:false};
+  G.p2={x:COLS-2.5,y:ROWS-2.5,ang:Math.PI,tAng:Math.PI,hp:MAX_HP,rot:false};
+  G.prev1={x:G.p1.x,y:G.p1.y};G.prev2={x:G.p2.x,y:G.p2.y};
+  G.missiles=[];G.explosions=[];G.queue=[];
+  G.elapsed=0;G.dmg1=0;G.dmg2=0;G.winner=null;
+  G.fireCd1=0;G.fireCd2=0;G.aiFireCd=0;
+  G.aiPath=[];G.aiPathTimer=0;G.aiStuckTimer=0;G.aiLastDrive=0;
+  G.aiLast1={x:G.p1.x,y:G.p1.y};G.aiLast2={x:G.p2.x,y:G.p2.y};
+  if(net.mode==='host'&&net.connected)sendNet({t:'start',blocked:Array.from(G.blocked)});
+}
+function backToMenu(){
+  if(net.mode==='host'&&net.connected)sendNet({t:'back'});
+  stopHeartbeat();unsubscribeLobby();destroyPeer();
+  net.mode='off';G.state='menu';
+  G.queue=[];G.missiles=[];G.explosions=[];G.winner=null;
+}
+
+// ---- 碰撞 ----
+function hit(x,y){const r=.30;for(const ox of[-r,0,r])for(const oy of[-r,0,r])if(G.blocked.has(key(Math.floor(x+ox),Math.floor(y+oy))))return true;return false}
+function tryMove(p,dx,dy){const nx=p.x+dx;if(!hit(nx,p.y))p.x=nx;const ny=p.y+dy;if(!hit(p.x,ny))p.y=ny}
+function lineClear(x0,y0,x1,y1){const d=Math.hypot(x1-x0,y1-y0),s=Math.floor(d*3)+1;for(let i=0;i<=s;i++){const t=i/s;if(G.blocked.has(key(Math.floor(x0+(x1-x0)*t),Math.floor(y0+(y1-y0)*t))))return false}return true}
+
+// ---- AI ----
+function nearestOpen(cell,maxR=6){
+  if(!G.blocked.has(key(cell[0],cell[1])))return cell;
+  const[cx,cy]=cell;
+  for(let r=1;r<=maxR;r++)for(let dx=-r;dx<=r;dx++)for(let dy=-r;dy<=r;dy++){
+    if(Math.abs(dx)!==r&&Math.abs(dy)!==r)continue;
+    const nx=cx+dx,ny=cy+dy;
+    if(nx<0||nx>=COLS||ny<0||ny>=ROWS)continue;
+    if(!G.blocked.has(key(nx,ny)))return[nx,ny];
+  }
+  return null;
+}
+function planAiPath(cx,cy,tx,ty){
+  let s=[Math.round(cx-.5),Math.round(cy-.5)],g=[Math.round(tx-.5),Math.round(ty-.5)];
+  if(G.blocked.has(key(s[0],s[1])))s=nearestOpen(s);
+  if(G.blocked.has(key(g[0],g[1])))g=nearestOpen(g);
+  if(!s||!g)return[];
+  const p=astar(G.blocked,s,g);return p&&p.length>1?p.slice(1):[];
+}
+function getAiInput(aiPlayer,dt){
+  const cfg=AI_DIFFICULTY[G.aiDifficulty];
+  let cx,cy,ang,tx,ty,lX,lY;
+  if(aiPlayer===1){cx=G.p1.x;cy=G.p1.y;ang=G.p1.ang;tx=G.p2.x;ty=G.p2.y;lX=G.aiLast1.x;lY=G.aiLast1.y}
+  else{cx=G.p2.x;cy=G.p2.y;ang=G.p2.ang;tx=G.p1.x;ty=G.p1.y;lX=G.aiLast2.x;lY=G.aiLast2.y}
+  let dx=tx-cx,dy=ty-cy,dist=Math.hypot(dx,dy);
+  if(dist<1e-6)return[0,0,false];
+  let aX=tx,aY=ty;
+  if(cfg.lead_aim&&dt>0){
+    let vx,vy;
+    if(aiPlayer===1){vx=(G.p2.x-G.prev2.x)/dt;vy=(G.p2.y-G.prev2.y)/dt}
+    else{vx=(G.p1.x-G.prev1.x)/dt;vy=(G.p1.y-G.prev1.y)/dt}
+    const ft=dist/MISSILE_SPEED;aX=tx+vx*ft*.9;aY=ty+vy*ft*.9;
+  }
+  const aToE=Math.atan2(aY-cy,aX-cx),diffToE=angleDiff(ang,aToE),los=lineClear(cx,cy,tx,ty);
+  const moved=Math.hypot(cx-lX,cy-lY);
+  if(G.aiLastDrive!==0&&moved<.02)G.aiStuckTimer+=dt;else G.aiStuckTimer=0;
+  if(G.aiStuckTimer>.25){G.aiPath=[];G.aiPathTimer=0;G.aiStuckTimer=0}
+  if(aiPlayer===1){G.aiLast1.x=cx;G.aiLast1.y=cy}else{G.aiLast2.x=cx;G.aiLast2.y=cy}
+  let rot=0,drive=0,fire=false;
+  const ready=los&&dist>=1.2&&dist<=cfg.fire_range;
+  if(ready){
+    if(diffToE>cfg.turn_deadzone)rot=1;else if(diffToE<-cfg.turn_deadzone)rot=-1;
+    if(Math.abs(diffToE)<.6){
+      if(dist>cfg.approach_dist)drive=1;
+      else if(dist<cfg.retreat_dist)drive=-1;
+      else if(Math.random()<cfg.advance_prob*.3)drive=1;
+    }
+    if(Math.abs(diffToE)<cfg.aim_tolerance&&G.aiFireCd<=0){fire=true;G.aiFireCd=cfg.fire_cd}
+  }else{
+    G.aiPathTimer-=dt;
+    if(G.aiPathTimer<=0||!G.aiPath.length){G.aiPathTimer=.5;G.aiPath=planAiPath(cx,cy,tx,ty)}
+    while(G.aiPath.length){
+      const wp=G.aiPath[0];
+      if(Math.hypot(wp[0]+.5-cx,wp[1]+.5-cy)<.4)G.aiPath.shift();else break;
+    }
+    if(G.aiPath.length){
+      const wp=G.aiPath[0];
+      const ma=Math.atan2(wp[1]+.5-cy,wp[0]+.5-cx),dm=angleDiff(ang,ma);
+      if(dm>cfg.turn_deadzone)rot=1;else if(dm<-cfg.turn_deadzone)rot=-1;
+      if(Math.abs(dm)<.7)drive=1;
+    }else{
+      if(diffToE>cfg.turn_deadzone)rot=1;else if(diffToE<-cfg.turn_deadzone)rot=-1;
+      if(Math.abs(diffToE)<.7){
+        if(dist>cfg.approach_dist)drive=1;else if(dist<cfg.retreat_dist)drive=-1;
+      }
+    }
+  }
+  G.aiLastDrive=drive;
+  return[rot,drive,fire];
+}
+
+// ---- 导弹/爆炸 ----
+function fireMissile(player){
+  if(G.state!=='play')return;
+  if(player===1){
+    if(G.fireCd1>0)return;G.fireCd1=.35;
+    const p=G.p1;
+    G.missiles.push({x:p.x+Math.cos(p.ang)*.8,y:p.y+Math.sin(p.ang)*.8,ang:p.ang,owner:1});
+  }else{
+    if(G.fireCd2>0)return;G.fireCd2=.35;
+    const p=G.p2;
+    G.missiles.push({x:p.x+Math.cos(p.ang)*.8,y:p.y+Math.sin(p.ang)*.8,ang:p.ang,owner:2});
+  }
+}
+function explode(x,y,owner){
+  G.explosions.push({x,y,t:0});
+  const list=[{p:G.p1,pl:1},{p:G.p2,pl:2}];
+  for(const t of list){
+    const d=Math.hypot(t.p.x-x,t.p.y-y);
+    if(d<=EXPLOSION_RADIUS){
+      const k=d/EXPLOSION_RADIUS,dmg=DMG_CENTER+(DMG_EDGE-DMG_CENTER)*k;
+      const b=t.p.hp;t.p.hp=Math.max(0,b-dmg);const a=b-t.p.hp;
+      if(owner!=null&&owner!==t.pl){if(owner===1)G.dmg1+=a;else G.dmg2+=a}
+    }
+  }
+  if(G.state==='play'&&(G.p1.hp<=0||G.p2.hp<=0)){
+    G.state='over';
+    if(G.p1.hp<=0&&G.p2.hp<=0)G.winner='平 局';
+    else if(G.p1.hp<=0)G.winner='蓝车 获胜';
+    else G.winner='红车 获胜';
+  }
+}
+function updateMissiles(dt){
+  const keep=[];
+  for(const m of G.missiles){
+    m.x+=Math.cos(m.ang)*MISSILE_SPEED*dt;
+    m.y+=Math.sin(m.ang)*MISSILE_SPEED*dt;
+    const cx=Math.floor(m.x),cy=Math.floor(m.y);
+    if(cx<0||cx>=COLS||cy<0||cy>=ROWS||G.blocked.has(key(cx,cy))){explode(m.x,m.y,m.owner);continue}
+    const tgt=m.owner===1?G.p2:G.p1;
+    if(Math.hypot(m.x-tgt.x,m.y-tgt.y)<.55){explode(m.x,m.y,m.owner);continue}
+    keep.push(m);
+  }
+  G.missiles=keep;
+}
+
+// ---- 主更新 ----
+function update(dt){
+  if(dt<=0)return;
+  if(G.state!=='play'&&G.state!=='over')return;
+  if(G.state==='play')G.elapsed+=dt;
+  if(G.fireCd1>0)G.fireCd1-=dt;
+  if(G.fireCd2>0)G.fireCd2-=dt;
+  if(G.aiFireCd>0)G.aiFireCd-=dt;
+  G.prev1.x=G.p1.x;G.prev1.y=G.p1.y;G.prev2.x=G.p2.x;G.prev2.y=G.p2.y;
+
+  const K=G.keys;
+  let aRot=0;
+  if(K.has('KeyQ')||K.has('ArrowLeft'))aRot-=1;
+  if(K.has('KeyE')||K.has('ArrowRight'))aRot+=1;
+  let aDrv=0;
+  if(K.has('ArrowUp'))aDrv=1;else if(K.has('ArrowDown'))aDrv=-1;
+  let aFire=K.has('Space');
+  if(G.touch.active){
+    if(G.touch.joyY<-.35)aDrv=1;else if(G.touch.joyY>.35)aDrv=-1;
+    if(G.touch.joyX<-.3)aRot=-1;else if(G.touch.joyX>.3)aRot=1;
+  }
+  if(G.touch.fire)aFire=true;
+
+  let wRot=0,wDrv=0,wFire=false;
+  if(net.mode==='host'){
+    const RK=net.remoteKeys;
+    if(RK.has('KeyA')||RK.has('ArrowLeft'))wRot-=1;
+    if(RK.has('KeyD')||RK.has('ArrowRight'))wRot+=1;
+    if(RK.has('KeyW')||RK.has('ArrowUp'))wDrv=1;else if(RK.has('KeyS')||RK.has('ArrowDown'))wDrv=-1;
+    wFire=RK.has('Space')||RK.has('Enter');
+  }else{
+    if(K.has('KeyA'))wRot-=1;if(K.has('KeyD'))wRot+=1;
+    if(K.has('KeyW'))wDrv=1;else if(K.has('KeyS'))wDrv=-1;
+    wFire=K.has('Enter');
+  }
+
+  let r1,d1,f1,r2,d2,f2;
+  if(G.playMode==='single'){
+    if(G.selectedCar==='red'){r1=aRot;d1=aDrv;f1=aFire;[r2,d2,f2]=getAiInput(2,dt)}
+    else{[r1,d1,f1]=getAiInput(1,dt);r2=aRot;d2=aDrv;f2=aFire}
+  }else if(G.playMode==='double'){
+    if(G.selectedCar==='blue'){r1=wRot;d1=wDrv;f1=wFire;r2=aRot;d2=aDrv;f2=aFire}
+    else{r1=aRot;d1=aDrv;f1=aFire;r2=wRot;d2=wDrv;f2=wFire}
+  }else{r1=aRot;d1=aDrv;f1=aFire;r2=wRot;d2=wDrv;f2=wFire}
+
+  applyCar(G.p1,r1,d1,f1,1,dt);
+  applyCar(G.p2,r2,d2,f2,2,dt);
+  if(G.state==='play')updateMissiles(dt);
+
+  const keep=[];
+  for(const e of G.explosions){e.t+=dt;if(e.t<EXPLOSION_DURATION)keep.push(e)}
+  G.explosions=keep;
+}
+
+const MANUAL_ROT=3.5,ROT_SPEED=10.0,SPEED=9.0,REVERSE_RATIO=.55;
+function applyCar(p,rot,drive,fire,player,dt){
+  p.rot=rot!==0;
+  if(p.rot)p.tAng=normAngle(p.tAng+rot*MANUAL_ROT*dt);
+  if(drive!==0){
+    if(player===1)G.queue=[];
+    const spd=SPEED*(drive<0?REVERSE_RATIO:1);
+    const ca=Math.cos(p.ang),sa=Math.sin(p.ang);
+    tryMove(p,drive*ca*spd*dt,drive*sa*spd*dt);
+  }else if(player===1&&G.queue.length>0){
+    while(G.queue.length>0&&!G.queue[0].path.length)G.queue.shift();
+    if(G.queue.length>0){
+      const seg=G.queue[0],tgt=seg.path[0];
+      const tx=tgt[0]+.5,ty=tgt[1]+.5;
+      const dx=tx-p.x,dy=ty-p.y,dist=Math.hypot(dx,dy);
+      if(dist<1e-6)seg.path.shift();
+      else{
+        const step=SPEED*dt;
+        if(step>=dist){p.x=tx;p.y=ty;seg.path.shift()}
+        else{p.x+=dx/dist*step;p.y+=dy/dist*step}
+        p.tAng=Math.atan2(dy,dx);
+      }
+    }
+  }
+  const diff=angleDiff(p.ang,p.tAng),ms=ROT_SPEED*dt;
+  if(Math.abs(diff)<=ms)p.ang=p.tAng;
+  else p.ang=normAngle(p.ang+Math.sign(diff)*ms);
+  if(fire)fireMissile(player);
+}
+
+// ---- 序列化 ----
+function serializeState(){
+  return{
+    p1:{x:+G.p1.x.toFixed(3),y:+G.p1.y.toFixed(3),ang:+G.p1.ang.toFixed(3),hp:+G.p1.hp.toFixed(1),rot:G.p1.rot},
+    p2:{x:+G.p2.x.toFixed(3),y:+G.p2.y.toFixed(3),ang:+G.p2.ang.toFixed(3),hp:+G.p2.hp.toFixed(1),rot:G.p2.rot},
+    missiles:G.missiles.map(m=>({x:+m.x.toFixed(2),y:+m.y.toFixed(2),ang:+m.ang.toFixed(2),owner:m.owner})),
+    explosions:G.explosions.map(e=>({x:+e.x.toFixed(2),y:+e.y.toFixed(2),t:+e.t.toFixed(3)})),
+    elapsed:+G.elapsed.toFixed(2),dmg1:+G.dmg1.toFixed(1),dmg2:+G.dmg2.toFixed(1),
+    winner:G.winner||''
+  };
+}
+function applyState(s){
+  G.p1.x=s.p1.x;G.p1.y=s.p1.y;G.p1.ang=s.p1.ang;G.p1.hp=s.p1.hp;G.p1.rot=s.p1.rot;
+  G.p2.x=s.p2.x;G.p2.y=s.p2.y;G.p2.ang=s.p2.ang;G.p2.hp=s.p2.hp;G.p2.rot=s.p2.rot;
+  G.missiles=s.missiles;G.explosions=s.explosions;
+  G.elapsed=s.elapsed;G.dmg1=s.dmg1;G.dmg2=s.dmg2;
+  if(s.winner){G.winner=s.winner;G.state='over'}
+}
+
+// ---- 渲染 ----
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  if(G.state==='menu'){drawMenu();return}
+  if(G.state==='lobby'){drawLobby();return}
+  if(G.state==='host-wait'){drawHostWait();return}
+  if(G.state==='join-wait'){drawJoinWait();return}
+  if(G.state==='select'){drawSelect();return}
+
+  ctx.strokeStyle='#171a21';ctx.lineWidth=1;ctx.beginPath();
+  for(let i=0;i<=COLS;i++){ctx.moveTo(i*CELL+.5,0);ctx.lineTo(i*CELL+.5,H)}
+  for(let j=0;j<=ROWS;j++){ctx.moveTo(0,j*CELL+.5);ctx.lineTo(W,j*CELL+.5)}
+  ctx.stroke();
+  ctx.fillStyle='#2b3242';ctx.strokeStyle='#3c4557';
+  for(const k of G.blocked){
+    const c=k%COLS,r=Math.floor(k/COLS),x=c*CELL,y=r*CELL;
+    ctx.fillRect(x,y,CELL,CELL);ctx.strokeRect(x+.5,y+.5,CELL-1,CELL-1);
+  }
+  drawQueue();
+  for(const e of G.explosions){
+    const t=e.t/EXPLOSION_DURATION,r=EXPLOSION_RADIUS*CELL*(.45+.55*t);
+    const cx=e.x*CELL,cy=e.y*CELL;
+    ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.strokeStyle='#ff8c00';ctx.lineWidth=3;ctx.stroke();
+    ctx.beginPath();ctx.arc(cx,cy,r*.62,0,Math.PI*2);ctx.fillStyle='#ffcc33';ctx.strokeStyle='#ff6600';ctx.lineWidth=2;ctx.fill();ctx.stroke();
+    ctx.beginPath();ctx.arc(cx,cy,r*.28,0,Math.PI*2);ctx.fillStyle='#fff6c2';ctx.fill();
+  }
+  for(const m of G.missiles){
+    const mx=m.x*CELL,my=m.y*CELL;
+    const ca=Math.cos(m.ang),sa=Math.sin(m.ang),size=CELL*.42;
+    const P=(x,y)=>[mx+x*ca-y*sa,my+x*sa+y*ca];
+    const color=m.owner===1?'#ff6b6b':'#60a5fa';
+    const[p0x,p0y]=P(size,0),[p1x,p1y]=P(-size*.65,-size*.5),[p2x,p2y]=P(-size*.65,size*.5);
+    ctx.beginPath();ctx.moveTo(p0x,p0y);ctx.lineTo(p1x,p1y);ctx.lineTo(p2x,p2y);ctx.closePath();
+    ctx.fillStyle=color;ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=1;ctx.stroke();
+    const[t0x,t0y]=P(-size*.65,0),[t1x,t1y]=P(-size*1.6,0);
+    ctx.beginPath();ctx.moveTo(t0x,t0y);ctx.lineTo(t1x,t1y);ctx.strokeStyle='#ffaa33';ctx.lineWidth=2;ctx.stroke();
+  }
+  drawCone(G.p1,G.p1.rot,'#39d98a');
+  drawCone(G.p2,G.p2.rot,'#3b82f6');
+  drawCar(G.p1,'#e94b3c','#c43a2c','#ffd8d3','#8fd3ff','#ffd84d');
+  drawCar(G.p2,'#3b82f6','#1d4ed8','#dbeafe','#93c5fd','#fbbf24');
+  drawHUD();
+  if(G.state==='over')drawGameOver();
+}
+
+function drawMenu(){
+  ctx.fillStyle='#0f1115';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#39d98a';ctx.font='bold 42px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('双 车 对 战',W/2,80);
+  ctx.fillStyle='#5a6472';ctx.font='14px Consolas, monospace';
+  ctx.fillText('2D Map · 寻路小车 · 导弹对战',W/2,125);
+
+  const bw=240,bh=52,gap=16;
+  const items=[
+    {id:'single',label:'单人游戏'},
+    {id:'double',label:'本地双人'},
+    {id:'lobby',label:'浏览房间大厅'},
+    {id:'create',label:'创建房间'},
+    {id:'join',label:'输入房间码加入'},
+  ];
+  const totalH=items.length*bh+(items.length-1)*gap;
+  const startY=(H-totalH)/2+30;
+  G.btns.menuBtns=[];
+  for(let i=0;i<items.length;i++){
+    const x=(W-bw)/2,y=startY+i*(bh+gap);
+    G.btns.menuBtns.push({rect:[x,y,x+bw,y+bh],id:items[i].id});
+    ctx.fillStyle='#1f3a2b';ctx.fillRect(x,y,bw,bh);
+    ctx.strokeStyle='#39d98a';ctx.lineWidth=3;ctx.strokeRect(x+1.5,y+1.5,bw-3,bh-3);
+    ctx.fillStyle='#39d98a';ctx.font='bold 18px Consolas, monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(items[i].label,W/2,y+bh/2);
+  }
+  const lastRoom=(()=>{try{return localStorage.getItem('carx_last_room')||''}catch(e){return''}})();
+  if(lastRoom){
+    ctx.fillStyle='#5a6472';ctx.font='11px Consolas, monospace';
+    ctx.textBaseline='bottom';
+    ctx.fillText('上次房间: '+lastRoom+'（在大厅里找它，或手动输入）',W/2,H-20);
+  }
+}
+
+function drawLobby(){
+  ctx.fillStyle='#0f1115';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#39d98a';ctx.font='bold 22px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='top';
+  ctx.fillText('房 间 大 厅',W/2,30);
+
+  const rooms=getActiveRooms();
+  ctx.fillStyle='#5a6472';ctx.font='13px Consolas, monospace';
+  ctx.fillText('自动扫描公共房间 · 每 8 秒刷新 · 空闲 22 秒自动消失',W/2,64);
+  ctx.fillStyle='#a9b4c2';ctx.font='14px Consolas, monospace';
+  ctx.fillText('当前在线房间：'+rooms.length,W/2,92);
+
+  // 房间列表
+  const listX=W/2-300,listY=130,listW=600,rowH=52,gap=10;
+  G.btns.lobbyBtns=[];
+  for(let i=0;i<Math.min(rooms.length,7);i++){
+    const room=rooms[i];
+    const y=listY+i*(rowH+gap);
+    const isMine=(net.roomId===room);
+    const x=listX;
+    G.btns.lobbyBtns.push({rect:[x,y,x+listW,y+rowH],room});
+    ctx.fillStyle=isMine?'#2a3d20':'#12161d';
+    ctx.fillRect(x,y,listW,rowH);
+    ctx.strokeStyle='#39d98a';ctx.lineWidth=2;ctx.strokeRect(x+1,y+1,listW-2,rowH-2);
+    ctx.fillStyle='#39d98a';ctx.font='bold 22px Consolas, monospace';
+    ctx.textAlign='left';ctx.textBaseline='middle';
+    ctx.fillText(room,x+25,y+rowH/2);
+    ctx.fillStyle='#a9b4c2';ctx.font='12px Consolas, monospace';
+    ctx.textAlign='right';
+    ctx.fillText(isMine?'(我的房间)':'点击加入',x+listW-25,y+rowH/2);
+  }
+
+  if(rooms.length===0){
+    ctx.fillStyle='#5a6472';ctx.font='14px Consolas, monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('暂无在线房间',W/2,listY+60);
+    ctx.fillText('可以自己点"创建房间"当房主',W/2,listY+90);
+  }
+
+  // 返回 + 刷新
+  const bw=140,bh=44;
+  const rx=W/2-bw-10,by=H-70;
+  G.btns.lobbyBack=[rx,by,rx+bw,by+bh];
+  ctx.fillStyle='#1a1d24';ctx.fillRect(rx,by,bw,bh);
+  ctx.strokeStyle='#3c4557';ctx.lineWidth=2;ctx.strokeRect(rx+1,by+1,bw-2,bh-2);
+  ctx.fillStyle='#7a8698';ctx.font='bold 14px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('返 回',rx+bw/2,by+bh/2);
+
+  const x2=W/2+10;
+  G.btns.lobbyCreate=[x2,by,x2+bw,by+bh];
+  ctx.fillStyle='#1f3a2b';ctx.fillRect(x2,by,bw,bh);
+  ctx.strokeStyle='#39d98a';ctx.lineWidth=2;ctx.strokeRect(x2+1,by+1,bw-2,bh-2);
+  ctx.fillStyle='#39d98a';
+  ctx.fillText('创建房间',x2+bw/2,by+bh/2);
+}
+
+function drawHostWait(){
+  ctx.fillStyle='#0f1115';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#39d98a';ctx.font='bold 26px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('房间已创建',W/2,110);
+  const rw=420,rh=130,rx=(W-rw)/2,ry=180;
+  ctx.fillStyle='#12161d';ctx.fillRect(rx,ry,rw,rh);
+  ctx.strokeStyle='#39d98a';ctx.lineWidth=2;ctx.strokeRect(rx+1,ry+1,rw-2,rh-2);
+  ctx.fillStyle='#5a6472';ctx.font='14px Consolas, monospace';
+  ctx.fillText('房间码',W/2,ry+28);
+  ctx.fillStyle='#39d98a';ctx.font='bold 52px Consolas, monospace';
+  ctx.fillText(net.roomId,W/2,ry+82);
+  ctx.fillStyle='#a9b4c2';ctx.font='15px Consolas, monospace';
+  ctx.fillText(net.statusMsg||'等待对方加入...',W/2,360);
+  ctx.fillStyle='#5a6472';ctx.font='11px Consolas, monospace';
+  ctx.fillText('房间已自动广播到大厅，对方可以在"浏览房间大厅"看到',W/2,395);
+  const bw=200,bh=48,bx=(W-bw)/2,by=430;
+  G.btns.cancelBtn=[bx,by,bx+bw,by+bh];
+  ctx.fillStyle='#3d2020';ctx.fillRect(bx,by,bw,bh);
+  ctx.strokeStyle='#ff6b6b';ctx.lineWidth=2;ctx.strokeRect(bx+1,by+1,bw-2,bh-2);
+  ctx.fillStyle='#ff6b6b';ctx.font='bold 16px Consolas, monospace';
+  ctx.fillText('取 消',W/2,by+bh/2);
+}
+
+function drawJoinWait(){
+  ctx.fillStyle='#0f1115';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#39d98a';ctx.font='bold 24px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('正在连接房间 '+net.roomId+' ...',W/2,H/2-20);
+  ctx.fillStyle='#a9b4c2';ctx.font='14px Consolas, monospace';
+  ctx.fillText(net.statusMsg||'请稍候',W/2,H/2+20);
+}
+
+function drawSelect(){
+  const isClient=(net.mode==='client');
+  ctx.textAlign='center';ctx.textBaseline='top';
+  if(isClient){
+    ctx.fillStyle='#39d98a';ctx.font='bold 22px Consolas, monospace';
+    ctx.fillText('已连接',W/2,60);
+    ctx.fillStyle='#a9b4c2';ctx.font='14px Consolas, monospace';
+    ctx.fillText('等待主机选择地图并开始...',W/2,110);
+    ctx.fillStyle='#ffb84d';ctx.font='13px Consolas, monospace';
+    ctx.fillText('你是蓝车（键盘 WASD / Enter，或手机虚拟摇杆）',W/2,160);
+    return;
+  }
+  ctx.fillStyle='#39d98a';ctx.font='bold 18px Consolas, monospace';
+  ctx.fillText('选择地图 · 模式 · 车辆 · AI',W/2,20);
+
+  const tW=130,tH=82,gap=14,total=NUM_MAPS*tW+(NUM_MAPS-1)*gap,x0=(W-total)/2,y0=64;
+  G.btns.mapRects=[];
+  for(let i=0;i<NUM_MAPS;i++){
+    const x=x0+i*(tW+gap);
+    G.btns.mapRects.push([x,y0,x+tW,y0+tH,i]);
+    const sel=i===G.selectedMapIdx;
+    ctx.fillStyle='#0f1115';ctx.fillRect(x,y0,tW,tH);
+    ctx.strokeStyle=sel?'#39d98a':'#3d5a4b';ctx.lineWidth=sel?3:2;
+    ctx.strokeRect(x+1,y0+1,tW-2,tH-2);
+    const sx=tW/COLS,sy=tH/ROWS;
+    ctx.fillStyle='#2b3242';
+    for(const k of G.maps[i]){
+      const c=k%COLS,r=Math.floor(k/COLS);
+      ctx.fillRect(x+c*sx,y0+r*sy,sx,sy);
+    }
+    ctx.fillStyle=sel?'#39d98a':'#a9b4c2';
+    ctx.font='bold 10px Consolas, monospace';
+    ctx.textAlign='center';ctx.textBaseline='top';
+    ctx.fillText('地图 '+(i+1),x+tW/2,y0+tH+6);
+  }
+
+  if(G.playMode!=='network'){
+    const mW=110,mH=34,mGap=20,tmW=mW*2+mGap,mx0=(W-tmW)/2,my0=184;
+    const sSel=G.playMode==='single';
+    G.btns.singleBtn=[mx0,my0,mx0+mW,my0+mH];
+    ctx.fillStyle=sSel?'#1f3a2b':'#1a1d24';ctx.fillRect(mx0,my0,mW,mH);
+    ctx.strokeStyle=sSel?'#39d98a':'#3c4557';ctx.lineWidth=sSel?3:2;
+    ctx.strokeRect(mx0+1,my0+1,mW-2,mH-2);
+    ctx.fillStyle=sSel?'#39d98a':'#7a8698';
+    ctx.font='bold 12px Consolas, monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('单 人',mx0+mW/2,my0+mH/2);
+    const dx0=mx0+mW+mGap,dSel=G.playMode==='double';
+    G.btns.doubleBtn=[dx0,my0,dx0+mW,my0+mH];
+    ctx.fillStyle=dSel?'#1f3a2b':'#1a1d24';ctx.fillRect(dx0,my0,mW,mH);
+    ctx.strokeStyle=dSel?'#39d98a':'#3c4557';ctx.lineWidth=dSel?3:2;
+    ctx.strokeRect(dx0+1,my0+1,mW-2,mH-2);
+    ctx.fillStyle=dSel?'#39d98a':'#7a8698';
+    ctx.fillText('双 人',dx0+mW/2,my0+mH/2);
+  }else{G.btns.singleBtn=null;G.btns.doubleBtn=null}
+
+  if(G.playMode==='single'){
+    ctx.fillStyle='#a9b4c2';ctx.font='10px Consolas, monospace';
+    ctx.textAlign='center';ctx.textBaseline='top';
+    ctx.fillText('AI 难度',W/2,236);
+    const aW=100,aH=32,aGap=20,tm=aW*2+aGap,ax0=(W-tm)/2,ay0=252;
+    const eSel=G.aiDifficulty==='easy';
+    G.btns.easyBtn=[ax0,ay0,ax0+aW,ay0+aH];
+    ctx.fillStyle=eSel?'#2a3d20':'#1a1d24';ctx.fillRect(ax0,ay0,aW,aH);
+    ctx.strokeStyle=eSel?'#7bd66a':'#3c4557';ctx.lineWidth=eSel?3:2;
+    ctx.strokeRect(ax0+1,ay0+1,aW-2,aH-2);
+    ctx.fillStyle=eSel?'#7bd66a':'#7a8698';
+    ctx.font='bold 12px Consolas, monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('简 单',ax0+aW/2,ay0+aH/2);
+    const hx0=ax0+aW+aGap,hSel=G.aiDifficulty==='hard';
+    G.btns.hardBtn=[hx0,ay0,hx0+aW,ay0+aH];
+    ctx.fillStyle=hSel?'#3d2020':'#1a1d24';ctx.fillRect(hx0,ay0,aW,aH);
+    ctx.strokeStyle=hSel?'#ff6b6b':'#3c4557';ctx.lineWidth=hSel?3:2;
+    ctx.strokeRect(hx0+1,ay0+1,aW-2,aH-2);
+    ctx.fillStyle=hSel?'#ff6b6b':'#7a8698';
+    ctx.fillText('困 难',hx0+aW/2,ay0+aH/2);
+  }else{G.btns.easyBtn=null;G.btns.hardBtn=null}
+
+  if(G.playMode!=='network'){
+    ctx.fillStyle='#a9b4c2';ctx.font='10px Consolas, monospace';
+    ctx.textAlign='center';ctx.textBaseline='top';
+    const t=G.playMode==='single'?'选择你的车辆（另一辆为 AI）':'选择你的车辆（红蓝各一人）';
+    ctx.fillText(t,W/2,302);
+    const bw=110,bh=42,bg=30,tbw=bw*2+bg,bx0=(W-tbw)/2,by0=318;
+    const rSel=G.selectedCar==='red';
+    G.btns.redBtn=[bx0,by0,bx0+bw,by0+bh];
+    ctx.fillStyle=rSel?'#3b1a18':'#1a1d24';ctx.fillRect(bx0,by0,bw,bh);
+    ctx.strokeStyle=rSel?'#e94b3c':'#5a3540';ctx.lineWidth=rSel?3:2;
+    ctx.strokeRect(bx0+1,by0+1,bw-2,bh-2);
+    ctx.fillStyle='#e94b3c';ctx.font='bold 13px Consolas, monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('红 车',bx0+bw/2,by0+bh/2);
+    const blx0=bx0+bw+bg,bSel=G.selectedCar==='blue';
+    G.btns.blueBtn=[blx0,by0,blx0+bw,by0+bh];
+    ctx.fillStyle=bSel?'#152238':'#1a1d24';ctx.fillRect(blx0,by0,bw,bh);
+    ctx.strokeStyle=bSel?'#3b82f6':'#35425a';ctx.lineWidth=bSel?3:2;
+    ctx.strokeRect(blx0+1,by0+1,bw-2,bh-2);
+    ctx.fillStyle='#3b82f6';
+    ctx.fillText('蓝 车',blx0+bw/2,by0+bh/2);
+  }else{
+    ctx.fillStyle='#a9b4c2';ctx.font='14px Consolas, monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('你是红车（方向键 / Q E / 空格）   对手是蓝车（WASD / Enter）',W/2,330);
+    G.btns.redBtn=null;G.btns.blueBtn=null;
+  }
+
+  const sw=220,sh=44,sx0=(W-sw)/2,sy0=396;
+  G.btns.startBtn=[sx0,sy0,sx0+sw,sy0+sh];
+  ctx.fillStyle='#1f3a2b';ctx.fillRect(sx0,sy0,sw,sh);
+  ctx.strokeStyle='#39d98a';ctx.lineWidth=3;ctx.strokeRect(sx0+1,sy0+1,sw-2,sh-2);
+  ctx.fillStyle='#39d98a';ctx.font='bold 16px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('开 始 战 斗',sx0+sw/2,sy0+sh/2);
+
+  const bbw=100,bbh=32,bbx0=20,bby0=H-52;
+  G.btns.backBtn=[bbx0,bby0,bbx0+bbw,bby0+bbh];
+  ctx.fillStyle='#1a1d24';ctx.fillRect(bbx0,bby0,bbw,bbh);
+  ctx.strokeStyle='#3c4557';ctx.lineWidth=2;ctx.strokeRect(bbx0+1,bby0+1,bbw-2,bbh-2);
+  ctx.fillStyle='#7a8698';ctx.font='12px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('返 回',bbx0+bbw/2,bby0+bbh/2);
+}
+
+function drawQueue(){
+  for(let i=0;i<G.queue.length;i++){
+    const seg=G.queue[i],pts=[];
+    if(i===0)pts.push([G.p1.x*CELL,G.p1.y*CELL]);
+    else pts.push([(seg.start[0]+.5)*CELL,(seg.start[1]+.5)*CELL]);
+    for(const[cc,rr]of seg.path)pts.push([(cc+.5)*CELL,(rr+.5)*CELL]);
+    if(pts.length<2)continue;
+    ctx.beginPath();ctx.moveTo(pts[0][0],pts[0][1]);
+    for(let j=1;j<pts.length;j++)ctx.lineTo(pts[j][0],pts[j][1]);
+    ctx.strokeStyle=i===0?'#39d98a':'#4f8a6c';ctx.lineWidth=i===0?3:2;
+    ctx.setLineDash(i===0?[6,5]:[4,4]);ctx.stroke();ctx.setLineDash([]);
+    const tx=(seg.target[0]+.5)*CELL,ty=(seg.target[1]+.5)*CELL;
+    ctx.beginPath();ctx.arc(tx,ty,9,0,Math.PI*2);
+    ctx.strokeStyle=i===0?'#39d98a':'#4f8a6c';ctx.lineWidth=2;ctx.stroke();
+    ctx.beginPath();ctx.arc(tx,ty,3,0,Math.PI*2);
+    ctx.fillStyle=i===0?'#39d98a':'#4f8a6c';ctx.fill();
+  }
+}
+function drawCone(p,rot,color){
+  const px=p.x*CELL,py=p.y*CELL,R=CELL*1.8,half=Math.PI*22/180;
+  ctx.beginPath();ctx.moveTo(px,py);
+  for(let i=0;i<=10;i++){const a=p.ang-half+2*half*i/10;ctx.lineTo(px+R*Math.cos(a),py+R*Math.sin(a))}
+  ctx.closePath();
+  const r=parseInt(color.slice(1,3),16),g=parseInt(color.slice(3,5),16),b=parseInt(color.slice(5,7),16);
+  ctx.fillStyle=`rgba(${r},${g},${b},.18)`;ctx.fill();
+  ctx.strokeStyle=rot?'#ffb84d':color;ctx.lineWidth=2;ctx.stroke();
+}
+function drawCar(p,body,roof,outline,glass,nose){
+  const px=p.x*CELL,py=p.y*CELL,L=CELL*.92,Wd=CELL*.62;
+  const ca=Math.cos(p.ang),sa=Math.sin(p.ang);
+  const P=(x,y)=>[px+x*ca-y*sa,py+x*sa+y*ca];
+  function poly(pts,fill,stroke,w){
+    ctx.beginPath();const p0=P(pts[0][0],pts[0][1]);ctx.moveTo(p0[0],p0[1]);
+    for(let i=1;i<pts.length;i++){const pp=P(pts[i][0],pts[i][1]);ctx.lineTo(pp[0],pp[1])}
+    ctx.closePath();
+    if(fill){ctx.fillStyle=fill;ctx.fill()}
+    if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=w||1;ctx.stroke()}
+  }
+  poly([[-L/2,-Wd/2],[L/2,-Wd/2],[L/2,Wd/2],[-L/2,Wd/2]],body,outline,2);
+  poly([[-L*.36,-Wd*.36],[L*.02,-Wd*.36],[L*.02,Wd*.36],[-L*.36,Wd*.36]],roof,null);
+  poly([[L*.06,-Wd*.34],[L*.30,-Wd*.34],[L*.30,Wd*.34],[L*.06,Wd*.34]],glass,null);
+  poly([[L/2,0],[L*.30,-Wd*.30],[L*.30,Wd*.30]],nose,null);
+  for(const[fx,fy]of[[L*.30,-Wd*.55],[L*.30,Wd*.55],[-L*.30,-Wd*.55],[-L*.30,Wd*.55]]){
+    const[x,y]=P(fx,fy);
+    ctx.beginPath();ctx.arc(x,y,2,0,Math.PI*2);ctx.fillStyle='#2b2b2b';ctx.fill();
+  }
+}
+function drawHpBar(x,y,w,h,hp,color,label){
+  ctx.fillStyle='#1a1d24';ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle='#3c4557';ctx.lineWidth=1;ctx.strokeRect(x+.5,y+.5,w-1,h-1);
+  const fw=Math.floor((w-2)*hp/MAX_HP);
+  if(fw>0){ctx.fillStyle=color;ctx.fillRect(x+1,y+1,fw,h-2)}
+  ctx.fillStyle='#c9d4e2';ctx.font='bold 10px Consolas, monospace';
+  ctx.textAlign='left';ctx.textBaseline='top';
+  ctx.fillText(label+'  HP: '+Math.floor(hp)+'/'+MAX_HP,x,y+h+6);
+}
+function drawHUD(){
+  drawHpBar(10,10,200,14,G.p1.hp,'#ef4444','红车');
+  drawHpBar(W-210,10,200,14,G.p2.hp,'#3b82f6','蓝车');
+  ctx.fillStyle='#fff';ctx.font='bold 13px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='top';
+  ctx.fillText('对局时长  '+fmtTime(G.elapsed),W/2,14);
+  let extra='';
+  if(G.playMode==='single'){extra='单人对 AI（'+(G.aiDifficulty==='easy'?'简单':'困难')+'）'}
+  else if(G.playMode==='double'){extra='本地双人'}
+  else{extra=net.mode==='host'?'联机 · 你是红车':'联机 · 你是蓝车'}
+  ctx.fillStyle='#a9b4c2';ctx.font='bold 10px Consolas, monospace';
+  ctx.fillText(extra,W/2,42);
+  ctx.fillStyle='#5a6472';ctx.font='10px Consolas, monospace';
+  ctx.textAlign='left';ctx.textBaseline='bottom';
+  ctx.fillText('红车: 方向键 + Q E + 空格  |  蓝车: WASD + Enter  |  左键寻路  |  R 重开  |  Esc 返回',10,H-8);
+}
+function drawGameOver(){
+  const cx=W/2,cy=H/2,pw=500,ph=380,px0=cx-pw/2,py0=cy-ph/2,px1=cx+pw/2,py1=cy+ph/2;
+  ctx.fillStyle='rgba(0,0,0,.55)';ctx.fillRect(px0-10,py0-10,pw+20,ph+20);
+  ctx.fillStyle='#12161d';ctx.fillRect(px0,py0,pw,ph);
+  ctx.strokeStyle='#39d98a';ctx.lineWidth=3;ctx.strokeRect(px0+1.5,py0+1.5,pw-3,ph-3);
+  ctx.textAlign='center';ctx.textBaseline='top';
+  ctx.fillStyle='#fff';ctx.font='bold 24px Consolas, monospace';
+  ctx.fillText('战 斗 结 束',cx,py0+30);
+  let wc='#39d98a';
+  if(G.winner&&G.winner.includes('蓝'))wc='#3b82f6';
+  else if(G.winner&&G.winner.includes('红'))wc='#e94b3c';
+  ctx.fillStyle=wc;ctx.font='bold 20px Consolas, monospace';
+  ctx.fillText(G.winner||'',cx,py0+72);
+  ctx.strokeStyle='#2a3240';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(px0+40,py0+118);ctx.lineTo(px1-40,py0+118);ctx.stroke();
+  const rows=[
+    ['对局时长',fmtTime(G.elapsed),'#fff'],
+    ['红车造成伤害',String(Math.floor(G.dmg1)),'#e94b3c'],
+    ['蓝车造成伤害',String(Math.floor(G.dmg2)),'#3b82f6'],
+    ['红车剩余血量',Math.floor(G.p1.hp)+' / '+MAX_HP,'#e94b3c'],
+    ['蓝车剩余血量',Math.floor(G.p2.hp)+' / '+MAX_HP,'#3b82f6']
+  ];
+  let y=py0+140;
+  for(const[label,val,color]of rows){
+    ctx.textAlign='left';ctx.fillStyle='#8a95a5';ctx.font='12px Consolas, monospace';
+    ctx.fillText(label,px0+55,y);
+    ctx.textAlign='right';ctx.fillStyle=color;ctx.font='bold 13px Consolas, monospace';
+    ctx.fillText(val,px1-55,y);
+    y+=32;
+  }
+  const bw=200,bh=46,bx0=cx-bw/2,by0=py1-68;
+  G.btns.returnBtn=[bx0,by0,bx0+bw,by0+bh];
+  ctx.fillStyle='#1f3a2b';ctx.fillRect(bx0,by0,bw,bh);
+  ctx.strokeStyle='#39d98a';ctx.lineWidth=3;ctx.strokeRect(bx0+1.5,by0+1.5,bw-3,bh-3);
+  ctx.fillStyle='#39d98a';ctx.font='bold 16px Consolas, monospace';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('返 回',cx,by0+bh/2);
+}
+
+// ---- 输入 ----
+function inRect(x,y,r){if(!r)return false;return x>=r[0]&&x<=r[2]&&y>=r[1]&&y<=r[3]}
+function toCanvas(cx,cy){const r=canvas.getBoundingClientRect();return{x:(cx-r.left)*(W/r.width),y:(cy-r.top)*(H/r.height)}}
+
+canvas.addEventListener('click',e=>{
+  const p=toCanvas(e.clientX,e.clientY);
+  handleClick(p.x,p.y,e.shiftKey);
+});
+
+function handleClick(cx,cy,shift){
+  if(G.state==='menu'){
+    if(!G.btns.menuBtns)return;
+    for(const b of G.btns.menuBtns){
+      if(inRect(cx,cy,b.rect)){
+        if(b.id==='single'){G.playMode='single';G.state='select'}
+        else if(b.id==='double'){G.playMode='double';G.state='select'}
+        else if(b.id==='lobby'){G.state='lobby';subscribeLobby()}
+        else if(b.id==='create'){hostRoom()}
+        else if(b.id==='join'){showJoinDialog()}
+        return;
+      }
+    }
+  }else if(G.state==='lobby'){
+    if(G.btns.lobbyBtns){
+      for(const b of G.btns.lobbyBtns){
+        if(inRect(cx,cy,b.rect)){joinRoom(b.room);return}
+      }
+    }
+    if(inRect(cx,cy,G.btns.lobbyBack)){unsubscribeLobby();G.state='menu';return}
+    if(inRect(cx,cy,G.btns.lobbyCreate)){unsubscribeLobby();hostRoom();return}
+  }else if(G.state==='host-wait'){
+    if(inRect(cx,cy,G.btns.cancelBtn)){backToMenu()}
+  }else if(G.state==='select'){
+    if(net.mode==='client')return;
+    if(inRect(cx,cy,G.btns.backBtn)){backToMenu();return}
+    if(G.btns.mapRects){
+      for(const r of G.btns.mapRects){
+        if(inRect(cx,cy,[r[0],r[1],r[2],r[3]])){G.selectedMapIdx=r[4];return}
+      }
+    }
+    if(inRect(cx,cy,G.btns.singleBtn)){G.playMode='single';return}
+    if(inRect(cx,cy,G.btns.doubleBtn)){G.playMode='double';return}
+    if(G.playMode==='single'){
+      if(inRect(cx,cy,G.btns.easyBtn)){G.aiDifficulty='easy';return}
+      if(inRect(cx,cy,G.btns.hardBtn)){G.aiDifficulty='hard';return}
+    }
+    if(G.playMode!=='network'){
+      if(inRect(cx,cy,G.btns.redBtn)){G.selectedCar='red';return}
+      if(inRect(cx,cy,G.btns.blueBtn)){G.selectedCar='blue';return}
+    }
+    if(inRect(cx,cy,G.btns.startBtn)){
+      if(G.playMode==='network'&&!net.connected){return}
+      startGame(G.selectedMapIdx);return;
+    }
+  }else if(G.state==='over'){
+    if(inRect(cx,cy,G.btns.returnBtn)){backToMenu();return}
+  }else if(G.state==='play'){
+    if(net.mode==='client')return;
+    if(G.playMode==='single'&&G.selectedCar!=='red')return;
+    const c=Math.floor(cx/CELL),r=Math.floor(cy/CELL);
+    if(c<0||c>=COLS||r<0||r>=ROWS)return;
+    if(G.blocked.has(key(c,r)))return;
+    const cc=[Math.round(G.p1.x-.5),Math.round(G.p1.y-.5)];
+    let start;
+    if(!shift){G.queue=[];start=cc}
+    else if(G.queue.length>0)start=G.queue[G.queue.length-1].target;
+    else start=cc;
+    if(G.blocked.has(key(start[0],start[1])))return;
+    const p=astar(G.blocked,start,[c,r]);
+    if(p&&p.length>1)G.queue.push({path:p.slice(1),start:start,target:[c,r]});
+  }
+}
+
+// ---- 键盘 ----
+const KEY_MAP=new Set(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','KeyQ','KeyE','Space','Enter','Escape','KeyR']);
+window.addEventListener('keydown',e=>{
+  if(KEY_MAP.has(e.code))e.preventDefault();
+  if(e.repeat)return;
+  G.keys.add(e.code);
+  if(e.code==='Escape'){
+    if(G.state==='play'||G.state==='over'){backToMenu()}
+    else if(G.state==='select'){if(net.mode==='client')return;backToMenu()}
+    else if(G.state==='host-wait'){backToMenu()}
+    else if(G.state==='lobby'){unsubscribeLobby();G.state='menu'}
+    return;
+  }
+  if(e.code==='KeyR'){
+    if((G.state==='over'||G.state==='play')&&net.mode!=='client')startGame(G.selectedMapIdx);
+    return;
+  }
+});
+window.addEventListener('keyup',e=>{G.keys.delete(e.code)});
+
+// ---- 触摸 ----
+const touchUI=document.getElementById('touch-ui');
+const joyZone=document.getElementById('joy-zone');
+const joyKnob=document.getElementById('joy-knob');
+const fireBtn=document.getElementById('fire-btn');
+const overlay=document.getElementById('overlay');
+const box=document.getElementById('box');
+
+function isTouchDevice(){return('ontouchstart'in window)||navigator.maxTouchPoints>0}
+function updateTouchUI(){const v=isTouchDevice()&&G.state==='play';touchUI.classList.toggle('visible',v)}
+
+let joyTouchId=null,joyStartX=0,joyStartY=0;
+joyZone.addEventListener('touchstart',e=>{
+  e.preventDefault();const t=e.changedTouches[0];joyTouchId=t.identifier;
+  const r=joyZone.getBoundingClientRect();joyStartX=r.left+r.width/2;joyStartY=r.top+r.height/2;
+  updateJoy(t.clientX,t.clientY);G.touch.active=true;
+},{passive:false});
+joyZone.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  for(const t of e.changedTouches)if(t.identifier===joyTouchId)updateJoy(t.clientX,t.clientY);
+},{passive:false});
+joyZone.addEventListener('touchend',e=>{
+  for(const t of e.changedTouches)if(t.identifier===joyTouchId){
+    joyTouchId=null;joyKnob.style.transform='translate(0,0)';
+    G.touch.joyX=0;G.touch.joyY=0;G.touch.active=false;
+  }
+});
+joyZone.addEventListener('touchcancel',()=>{
+  joyTouchId=null;joyKnob.style.transform='translate(0,0)';
+  G.touch.joyX=0;G.touch.joyY=0;G.touch.active=false;
+});
+function updateJoy(cx,cy){
+  const dx=cx-joyStartX,dy=cy-joyStartY,max=55,d=Math.hypot(dx,dy),k=d>max?max/d:1;
+  const ox=dx*k,oy=dy*k;
+  joyKnob.style.transform=`translate(${ox}px, ${oy}px)`;
+  G.touch.joyX=ox/max;G.touch.joyY=oy/max;
+}
+fireBtn.addEventListener('touchstart',e=>{e.preventDefault();G.touch.fire=true},{passive:false});
+fireBtn.addEventListener('touchend',e=>{e.preventDefault();G.touch.fire=false},{passive:false});
+fireBtn.addEventListener('touchcancel',()=>{G.touch.fire=false});
+
+canvas.addEventListener('touchstart',e=>{
+  e.preventDefault();
+  for(const t of e.changedTouches){
+    const p=toCanvas(t.clientX,t.clientY);
+    const jr=joyZone.getBoundingClientRect(),br=fireBtn.getBoundingClientRect();
+    const domX=t.clientX,domY=t.clientY;
+    const inJ=domX>=jr.left&&domX<=jr.right&&domY>=jr.top&&domY<=jr.bottom;
+    const inB=domX>=br.left&&domX<=br.right&&domY>=br.top&&domY<=br.bottom;
+    if(!inJ&&!inB)handleClick(p.x,p.y,false);
+  }
+},{passive:false});
+
+// ---- 加入对话框 ----
+function showJoinDialog(){
+  overlay.classList.remove('hidden');
+  box.innerHTML=`
+    <h2>输入房间码</h2>
+    <input id="joinInput" maxlength="6" placeholder="6 位房间码" autocomplete="off">
+    <div class="row">
+      <button class="btn-cancel" id="btnCancel">取消</button>
+      <button class="btn-ok" id="btnOk">连接</button>
+    </div>
+    <div class="msg" id="joinMsg"></div>
+  `;
+  const inp=document.getElementById('joinInput');
+  inp.focus();
+  document.getElementById('btnCancel').onclick=()=>overlay.classList.add('hidden');
+  document.getElementById('btnOk').onclick=()=>{
+    const code=inp.value.trim().toUpperCase();
+    if(code.length!==6){document.getElementById('joinMsg').textContent='请输入 6 位房间码';return}
+    overlay.classList.add('hidden');
+    joinRoom(code);
+  };
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('btnOk').click()});
+  inp.addEventListener('input',()=>{inp.value=inp.value.toUpperCase()});
+}
+
+// ---- 主循环 ----
+let lastTime=performance.now();
+function loop(now){
+  let dt=(now-lastTime)/1000;lastTime=now;
+  if(dt>.05)dt=.05;
+
+  if(net.mode==='client'){
+    if(net.connected&&G.state==='play'){
+      const keys=new Set(G.keys);
+      if(G.touch.active){
+        if(G.touch.joyY<-.35)keys.add('KeyW');else if(G.touch.joyY>.35)keys.add('KeyS');
+        if(G.touch.joyX<-.3)keys.add('KeyA');else if(G.touch.joyX>.3)keys.add('KeyD');
+      }
+      if(G.touch.fire)keys.add('Space');
+      sendNet({t:'keys',k:Array.from(keys)});
+    }
+    if(net.remoteState){applyState(net.remoteState);net.remoteState=null}
+    draw();
+  }else{
+    update(dt);
+    if(net.mode==='host'&&net.connected&&(G.state==='play'||G.state==='over')){
+      sendNet({t:'state',s:serializeState()});
+    }
+    draw();
+  }
+  updateTouchUI();
+  requestAnimationFrame(loop);
+}
+
+initMaps();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
